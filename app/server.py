@@ -205,8 +205,23 @@ class Service:
 
             if sub.tree_size < current.tree_size:
                 historical = store.checkpoint_at(log_id, sub.tree_size)
-                if historical is not None \
-                        and historical.root_hash == sub.root_hash:
+                if historical is None:
+                    # Never published a checkpoint at this size: stale.
+                    raise ApiError(
+                        409, "stale_tree_size",
+                        f"trusted tree is already at size {current.tree_size},"
+                        f" which is larger than {sub.tree_size}",
+                        {"trusted_tree_size": current.tree_size,
+                         "submitted_tree_size": sub.tree_size})
+                identical = (
+                    sub.root_hash == historical.root_hash
+                    and sub.timestamp_ms == historical.timestamp_ms
+                    and sub.public_key == historical.public_key
+                    and sub.signature == historical.signature
+                )
+                if identical:
+                    # Byte-identical retransmission of a published
+                    # checkpoint: stable idempotent replay.
                     return 200, {
                         "result": "already_trusted",
                         "log_id": log_id,
@@ -214,12 +229,39 @@ class Service:
                         "root_hash": historical.root_hash.hex(),
                         "public_key": historical.public_key.hex(),
                     }
+                # Verified signature over a DIFFERENT statement (root,
+                # timestamp, key or signature differs) at an already
+                # published tree size: this is equivocation evidence
+                # against that historical checkpoint, not a replay.  Seal
+                # the first evidence; the trusted head, its root hash and
+                # the frozen key stay untouched.
+                prior_fork = store.first_fork(log_id)
+                if prior_fork is not None:
+                    raise ApiError(
+                        409, "fork_evidence_sealed",
+                        "verified equivocation at a historical tree size;"
+                        " fork evidence is already sealed and the trusted"
+                        " head is unchanged",
+                        {"fork_id": prior_fork["id"],
+                         "trusted_tree_size": current.tree_size,
+                         "trusted_root_hash": current.root_hash.hex()})
+                fork_id = store.seal_fork(
+                    historical, sub, "historical_same_size_different_head",
+                    json.dumps([n.hex() for n in sub.consistency]).encode(),
+                    now_ms(),
+                )
                 raise ApiError(
-                    409, "stale_tree_size",
-                    f"trusted tree is already at size {current.tree_size},"
-                    f" which is larger than {sub.tree_size}",
-                    {"trusted_tree_size": current.tree_size,
-                     "submitted_tree_size": sub.tree_size})
+                    409, "fork_evidence_sealed",
+                    "verified equivocation at a historical tree size; the"
+                    " first fork evidence has been sealed against the"
+                    " published checkpoint and the trusted head is"
+                    " unchanged",
+                    {"fork_id": fork_id,
+                     "trusted_tree_size": current.tree_size,
+                     "trusted_root_hash": current.root_hash.hex(),
+                     "historical_tree_size": historical.tree_size,
+                     "historical_root_hash": historical.root_hash.hex(),
+                     "rival_root_hash": sub.root_hash.hex()})
 
             prior_fork = store.first_fork(log_id)
 

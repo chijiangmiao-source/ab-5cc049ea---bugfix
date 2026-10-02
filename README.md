@@ -62,9 +62,10 @@ MAGIC(16B, "SEAFLOOR-LOGCPT1") || u16 log_id 长度 || log_id(ASCII)
 | 首个有效提交（`consistency` 必须为空） | 201 | `result=frozen`，密钥冻结 |
 | 有效更大树且证明旧树为新树前缀 | 200 | `result=trusted, applied=true` |
 | 相同扩展的并发/串行重传 | 200 | 一次 `trusted`，其余 `already_trusted` |
-| 同尺寸但根/时间/密钥/签名不同（已验签） | 409 | `fork_evidence_sealed`，封存首个分叉证据，原记录不变 |
+| 历史已发布尺寸的逐字节相同重传 | 200 | `result=already_trusted`，稳定回放 |
+| 当前或历史已发布尺寸上的不同已验签声明（根/时间/密钥/签名任一不同） | 409 | `fork_evidence_sealed`，封存首个分叉证据，可信头与已发布历史不变 |
 | 封存分叉后的任何推进 | 409 | `log_sealed` |
-| 更小的树大小 | 409 | `stale_tree_size` |
+| 从未发布过的更小树大小 | 409 | `stale_tree_size` |
 | 扩展换用未冻结密钥 | 409 | `public_key_frozen` |
 | 空/截断/伪造证明、错误哈希 | 400 | `invalid_consistency_proof` |
 | 签名不覆盖规范二进制消息 | 400 | `invalid_signature` |
@@ -107,7 +108,11 @@ MAGIC(16B, "SEAFLOOR-LOGCPT1") || u16 log_id 长度 || log_id(ASCII)
    CPython 版本；挂载 `/var/run/docker.sock` 时还会核对 api/verify 同源镜像）；
 6. 同尺寸分叉冒烟：不同根/密钥的已验签对手头封存证据、第二个对手头不覆盖首证、
    封存后拒绝推进、伪造签名不留证据；
-7. 直接只读核验 SQLite 持久化记录；挂载 Docker socket 时重启 `api` 容器后
+7. 历史同尺寸分叉冒烟：树 3 冻结 → 合法推进到 5 → 同根但毫秒时间不同的已验签
+   历史竞争声明封存首个证据（可信头保持 5、证据对应尺寸 3 的检查点）→ 精确历史
+   重传稳定回放 → 未知旧尺寸按过期拒绝 → 第二个历史对手头不覆盖首证 →
+   封存后拒绝推进；
+8. 直接只读核验 SQLite 持久化记录；挂载 Docker socket 时重启 `api` 容器后
    重新查询可信检查点与分叉记录。
 
 ## 本地开发（无 Docker）

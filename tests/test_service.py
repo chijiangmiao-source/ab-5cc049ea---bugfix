@@ -96,6 +96,73 @@ class ServiceRules(unittest.TestCase):
                 proof=merkle.consistency_proof(5, h.leaves[:6])))
         self.assertEqual(ctx.exception.code, "log_sealed")
 
+    def test_historical_equivocation_seals_fork(self):
+        h, svc = self.h, self.h.svc
+        log = "H"
+        # Bootstrap at size 3, then legitimately advance to size 5.
+        first3 = h.sub(log, 3, 100)
+        status, out = svc.submit(log, first3)
+        self.assertEqual((status, out["result"]), (201, "frozen"))
+        status, out = svc.submit(
+            log, h.sub(log, 5, 200,
+                       proof=merkle.consistency_proof(3, h.leaves[:5])))
+        self.assertEqual(out["result"], "trusted")
+
+        # Exact historical retransmission replays stably.
+        replay = h.sub(log, 3, 100)
+        self.assertEqual(replay.signature, first3.signature)
+        status, out = svc.submit(log, replay)
+        self.assertEqual((status, out["result"]), (200, "already_trusted"))
+
+        # Same published size, same root, different signed milliseconds:
+        # a valid but divergent statement -> seal first fork evidence.
+        rival = h.sub(log, 3, 150)
+        self.assertEqual(rival.root_hash, first3.root_hash)
+        self.assertNotEqual(rival.signature, first3.signature)
+        with self.assertRaises(ApiError) as ctx:
+            svc.submit(log, rival)
+        self.assertEqual(ctx.exception.code, "fork_evidence_sealed")
+
+        # Trusted head, root and frozen key untouched; evidence points at
+        # the size-3 checkpoint and its rival claim.
+        desc = svc.describe_log(log)
+        self.assertEqual(desc["status"], "fork_sealed")
+        self.assertEqual(desc["tree_size"], 5)
+        self.assertEqual(desc["root_hash"], h.roots[5].hex())
+        self.assertEqual(desc["public_key"], h.pub.hex())
+        fork = desc["fork"]
+        self.assertEqual(fork["trusted"]["tree_size"], 3)
+        self.assertEqual(fork["trusted"]["root_hash"], h.roots[3].hex())
+        self.assertEqual(fork["trusted"]["timestamp_ms"], 100)
+        self.assertEqual(fork["trusted"]["signature"], first3.signature.hex())
+        self.assertEqual(fork["rival"]["root_hash"], h.roots[3].hex())
+        self.assertEqual(fork["rival"]["timestamp_ms"], 150)
+        self.assertEqual(fork["rival"]["signature"], rival.signature.hex())
+
+        # Exact historical retransmission still replays after sealing.
+        status, out = svc.submit(log, h.sub(log, 3, 100))
+        self.assertEqual((status, out["result"]), (200, "already_trusted"))
+
+        # A size that was never published stays a stale-size rejection.
+        with self.assertRaises(ApiError) as ctx:
+            svc.submit(log, h.sub(log, 4, 180))
+        self.assertEqual(ctx.exception.code, "stale_tree_size")
+
+        # A second divergent historical claim must not overwrite the
+        # first sealed evidence.
+        with self.assertRaises(ApiError) as ctx:
+            svc.submit(log, h.sub(log, 3, 160))
+        self.assertEqual(ctx.exception.code, "fork_evidence_sealed")
+        self.assertEqual(
+            svc.describe_log(log)["fork"]["rival"]["timestamp_ms"], 150)
+
+        # The sealed log must not advance any more.
+        with self.assertRaises(ApiError) as ctx:
+            svc.submit(log, h.sub(
+                log, 6, 300,
+                proof=merkle.consistency_proof(5, h.leaves[:6])))
+        self.assertEqual(ctx.exception.code, "log_sealed")
+
     def test_stale_and_key_freeze(self):
         h, svc = self.h, self.h.svc
         log = "K"

@@ -241,12 +241,15 @@ class Store:
                 self._conn.execute("ROLLBACK")
                 raise
 
-    def seal_fork(self, trusted: LogState, sub: "Submission", reason: str,
+    def seal_fork(self, trusted, sub: "Submission", reason: str,
                   proof_blob: bytes, now_ms: int) -> int:
         """Persist equivocation evidence without touching the trusted head.
 
-        Returns the fork record id.  An identical rival signature is a replay
-        of an already-sealed conflict and returns that record's id.
+        ``trusted`` is the published record the rival contradicts -- the
+        current head (``LogState``) or a historical checkpoint
+        (``CheckpointState``).  Returns the fork record id.  An identical
+        rival signature is a replay of an already-sealed conflict and
+        returns that record's id.
         """
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")

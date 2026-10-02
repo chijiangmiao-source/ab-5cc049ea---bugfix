@@ -1,7 +1,8 @@
 """Acceptance harness run by the Compose ``verify`` service.
 
 It exercises the running API over HTTP (first checkpoint freeze, legal
-extension, forged extension, fork sealing, replays, stale sizes), interleaves
+extension, forged extension, fork sealing, historical same-size rival
+claims, exact historical retransmission, stale sizes), interleaves
 in-process proof/algorithm tests and an image-build check, verifies durable
 records (restarting the API container when a Docker socket is available) and
 reports the overall verdict through its process exit code.
@@ -455,6 +456,118 @@ def smoke_fork_path() -> None:
           f"{status} {payload}")
 
 
+def smoke_historical_fork_path() -> None:
+    section("HTTP smoke: historical same-size rival seals first fork evidence")
+    log_id = "smoke-hist-fork"
+    seed_h, key_h = ed25519.generate_keypair()
+
+    leaves = [merkle.hash_leaf(b"hist-" + bytes([i])) for i in range(7)]
+    roots = {n: merkle.tree_hash(leaves[:n]) for n in range(1, 8)}
+
+    # 1. First checkpoint publishes tree size 3 and freezes the key.
+    first3 = checkpoint_body(key_h, seed_h, log_id, 3, 10_000, roots[3], [])
+    status, payload = http("POST", f"/logs/{log_id}/checkpoints", first3)
+    check("historical log bootstrapped at size 3",
+          status == 201 and payload.get("result") == "frozen",
+          f"{status} {payload}")
+
+    # 2. Legal consistency proof advances the trusted head to size 5.
+    status, payload = http("POST", f"/logs/{log_id}/checkpoints",
+                           checkpoint_body(key_h, seed_h, log_id, 5, 11_000,
+                                           roots[5],
+                                           merkle.consistency_proof(
+                                               3, leaves[:5])))
+    check("legal extension to size 5 trusted",
+          status == 200 and payload.get("result") == "trusted"
+          and payload.get("applied") is True, f"{status} {payload}")
+
+    # 3. Byte-identical retransmission of the size-3 checkpoint replays.
+    status, payload = http("POST", f"/logs/{log_id}/checkpoints", first3)
+    check("exact historical retransmission replays as already_trusted",
+          status == 200 and payload.get("result") == "already_trusted"
+          and payload.get("tree_size") == 3
+          and payload.get("root_hash") == roots[3].hex(),
+          f"{status} {payload}")
+
+    # 4. Rival claim at the published size 3: same root hash, but the
+    #    signature covers different milliseconds -> a valid statement that
+    #    is inconsistent with the published history.
+    rival3 = checkpoint_body(key_h, seed_h, log_id, 3, 10_500, roots[3], [])
+    check("rival differs only in the signed statement",
+          rival3["root_hash"] == first3["root_hash"]
+          and rival3["signature"] != first3["signature"], rival3["signature"])
+    status, payload = http("POST", f"/logs/{log_id}/checkpoints", rival3)
+    check("historical same-size rival seals fork evidence",
+          status == 409 and payload["error"]["code"] == "fork_evidence_sealed"
+          and payload["error"]["details"]["trusted_tree_size"] == 5
+          and payload["error"]["details"]["historical_tree_size"] == 3,
+          f"{status} {payload}")
+    fork_id = payload["error"]["details"]["fork_id"]
+
+    # 5. Trusted head (size 5), root hash and frozen key are not rewritten;
+    #    the sealed evidence names the size-3 checkpoint and its rival.
+    status, payload = http("GET", f"/logs/{log_id}")
+    check("trusted head still size 5 with frozen key after historical fork",
+          status == 200 and payload["tree_size"] == 5
+          and payload["root_hash"] == roots[5].hex()
+          and payload["public_key"] == key_h.hex()
+          and payload["status"] == "fork_sealed", str(payload))
+    fork = payload["fork"]
+    check("fork evidence bound to size-3 trusted checkpoint and rival claim",
+          fork["fork_id"] == fork_id
+          and fork["trusted"]["tree_size"] == 3
+          and fork["trusted"]["root_hash"] == roots[3].hex()
+          and fork["trusted"]["timestamp_ms"] == 10_000
+          and fork["trusted"]["signature"] == first3["signature"]
+          and fork["rival"]["root_hash"] == roots[3].hex()
+          and fork["rival"]["timestamp_ms"] == 10_500
+          and fork["rival"]["signature"] == rival3["signature"],
+          str(fork))
+
+    # 6. Exact historical retransmission still replays stably after sealing.
+    status, payload = http("POST", f"/logs/{log_id}/checkpoints", first3)
+    check("exact historical retransmission still replays after seal",
+          status == 200 and payload.get("result") == "already_trusted",
+          f"{status} {payload}")
+
+    # 7. A size that was never published stays a stale-size rejection.
+    status, payload = http("POST", f"/logs/{log_id}/checkpoints",
+                           checkpoint_body(key_h, seed_h, log_id, 4, 10_800,
+                                           roots[4], []))
+    check("unknown historical size rejected as stale_tree_size",
+          status == 409 and payload["error"]["code"] == "stale_tree_size",
+          f"{status} {payload}")
+
+    # 8. A second divergent claim at size 3 must not overwrite the first
+    #    sealed evidence.
+    rival3b = checkpoint_body(key_h, seed_h, log_id, 3, 10_900, roots[3], [])
+    status, payload = http("POST", f"/logs/{log_id}/checkpoints", rival3b)
+    check("second historical rival rejected against first evidence",
+          status == 409 and payload["error"]["code"] == "fork_evidence_sealed"
+          and payload["error"]["details"]["fork_id"] == fork_id,
+          f"{status} {payload}")
+    status, payload = http("GET", f"/logs/{log_id}")
+    check("first historical fork evidence preserved",
+          payload["fork"]["rival"]["signature"] == rival3["signature"],
+          str(payload["fork"]))
+
+    # 9. Once sealed, the log must not advance any more.
+    status, payload = http("POST", f"/logs/{log_id}/checkpoints",
+                           checkpoint_body(key_h, seed_h, log_id, 7, 12_000,
+                                           roots[7],
+                                           merkle.consistency_proof(
+                                               5, leaves[:7])))
+    check("sealed log refuses to advance",
+          status == 409 and payload["error"]["code"] == "log_sealed",
+          f"{status} {payload}")
+    status, payload = http("GET", f"/logs/{log_id}")
+    check("status, trusted head and first evidence persistently queryable",
+          status == 200 and payload["tree_size"] == 5
+          and payload["root_hash"] == roots[5].hex()
+          and payload["status"] == "fork_sealed"
+          and payload["fork"]["fork_id"] == fork_id, str(payload))
+
+
 # ------------------------------------------------------------ durability
 
 def durability_check() -> None:
@@ -472,11 +585,18 @@ def durability_check() -> None:
     n_fork = conn.execute(
         "SELECT COUNT(*) FROM forks WHERE log_id=?",
         ("smoke-fork",)).fetchone()[0]
+    hist_fork = conn.execute(
+        "SELECT trusted_size, trusted_ts, rival_ts FROM forks"
+        " WHERE log_id=?", ("smoke-hist-fork",)).fetchone()
     check("trusted head persisted (size 8, active)",
           n_primary == (8, "active"), str(n_primary))
     check("accepted checkpoints persisted (4,6,8)",
           n_cps == (3, 8), str(n_cps))
     check("exactly one fork record sealed", n_fork == 1, str(n_fork))
+    check("historical fork record persisted against size-3 checkpoint",
+          hist_fork is not None and hist_fork[0] == 3
+          and hist_fork[1] == 10_000 and hist_fork[2] == 10_500,
+          str(hist_fork))
     conn.close()
 
     if not _restart_api_via_docker():
@@ -492,6 +612,13 @@ def durability_check() -> None:
     check("fork record queryable after restart",
           status == 200 and payload["status"] == "fork_sealed"
           and payload["fork"] is not None, f"{status} {payload}")
+    status, payload = http("GET", "/logs/smoke-hist-fork")
+    check("historical fork evidence queryable after restart",
+          status == 200 and payload["status"] == "fork_sealed"
+          and payload["tree_size"] == 5
+          and payload["fork"] is not None
+          and payload["fork"]["trusted"]["tree_size"] == 3,
+          f"{status} {payload}")
 
 
 def _restart_api_via_docker() -> bool:
@@ -538,6 +665,7 @@ def main() -> int:
     smoke_extension_path()
     build_check()
     smoke_fork_path()
+    smoke_historical_fork_path()
     durability_check()
 
     print("\n=== summary ===")
