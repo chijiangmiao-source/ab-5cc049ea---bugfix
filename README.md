@@ -63,8 +63,10 @@ MAGIC(16B, "SEAFLOOR-LOGCPT1") || u16 log_id 长度 || log_id(ASCII)
 | 有效更大树且证明旧树为新树前缀 | 200 | `result=trusted, applied=true` |
 | 相同扩展的并发/串行重传 | 200 | 一次 `trusted`，其余 `already_trusted` |
 | 同尺寸但根/时间/密钥/签名不同（已验签） | 409 | `fork_evidence_sealed`，封存首个分叉证据，原记录不变 |
+| 对已发布历史尺寸（小于当前树）的已验签竞争声明，即使根哈希相同但签名时间不同 | 409 | `fork_evidence_sealed`，证据锚定**该历史尺寸的原始检查点**，当前更大的可信头不变 |
+| 已发布历史检查点的完全相同重传 | 200 | `already_trusted`，稳定回放 |
 | 封存分叉后的任何推进 | 409 | `log_sealed` |
-| 更小的树大小 | 409 | `stale_tree_size` |
+| 更小且从未发布过的树大小 | 409 | `stale_tree_size` |
 | 扩展换用未冻结密钥 | 409 | `public_key_frozen` |
 | 空/截断/伪造证明、错误哈希 | 400 | `invalid_consistency_proof` |
 | 签名不覆盖规范二进制消息 | 400 | `invalid_signature` |
@@ -81,7 +83,9 @@ MAGIC(16B, "SEAFLOOR-LOGCPT1") || u16 log_id 长度 || log_id(ASCII)
 ### `GET /logs/{logId}`
 
 返回可信树大小、根哈希、时间戳、冻结公钥、状态（`active` /
-`fork_sealed`）及首个分叉证据（`fork` 字段，含可信头与分叉头的完整快照与签名）。
+`fork_sealed`）及首个分叉证据（`fork` 字段，含可信头与分叉头的完整快照与签名；
+当竞争声明针对已发布的历史尺寸时，`fork.trusted` 锚定该尺寸的**原始**检查点，
+而顶层树大小/根哈希保持当前更大的可信头不变）。
 
 另有 `GET /healthz` 与 `GET /logs`。
 
@@ -107,7 +111,11 @@ MAGIC(16B, "SEAFLOOR-LOGCPT1") || u16 log_id 长度 || log_id(ASCII)
    CPython 版本；挂载 `/var/run/docker.sock` 时还会核对 api/verify 同源镜像）；
 6. 同尺寸分叉冒烟：不同根/密钥的已验签对手头封存证据、第二个对手头不覆盖首证、
    封存后拒绝推进、伪造签名不留证据；
-7. 直接只读核验 SQLite 持久化记录；挂载 Docker socket 时重启 `api` 容器后
+7. 历史同尺寸竞争声明冒烟：尺寸 3 首检点 → 合法证明扩展到尺寸 5 → 同根但不同
+   毫秒时间的尺寸 3 已签名重述封存首个证据（锚定原尺寸 3 检查点、尺寸 5 头不变、
+   日志 `fork_sealed`），原尺寸 3 检查点精确重传仍稳定回放、从未发布的旧尺寸仍按
+   `stale_tree_size` 拒绝、封存后拒绝推进；
+8. 直接只读核验 SQLite 持久化记录；挂载 Docker socket 时重启 `api` 容器后
    重新查询可信检查点与分叉记录。
 
 ## 本地开发（无 Docker）

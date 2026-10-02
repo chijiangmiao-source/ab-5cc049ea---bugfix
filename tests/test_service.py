@@ -96,6 +96,84 @@ class ServiceRules(unittest.TestCase):
                 proof=merkle.consistency_proof(5, h.leaves[:6])))
         self.assertEqual(ctx.exception.code, "log_sealed")
 
+    def test_historical_size_competing_claim(self):
+        """A verified claim about an already-published size with the same
+        root hash but a different signed timestamp is equivocation about
+        history: seal first evidence against the original checkpoint while
+        the larger trusted head stays intact."""
+        h, svc = self.h, self.h.svc
+        log = "H"
+
+        # Published history: size 3 ... advanced (with a valid proof) to 5.
+        status, out = svc.submit(log, h.sub(log, 3, 100))
+        self.assertEqual((status, out["result"]), (201, "frozen"))
+        root3 = h.roots[3]
+        proof35 = merkle.consistency_proof(3, h.leaves[:5])
+        status, out = svc.submit(log, h.sub(log, 5, 200, proof=proof35))
+        self.assertEqual(out["result"], "trusted")
+
+        # A stale size that was never published keeps being rejected as
+        # stale, never sealed.
+        with self.assertRaises(ApiError) as ctx:
+            svc.submit(log, h.sub(log, 2, 50))
+        self.assertEqual(ctx.exception.code, "stale_tree_size")
+
+        # Re-signed size-3 checkpoint: same root, different millisecond
+        # timestamp -> different signature over the canonical message.
+        rival = h.sub(log, 3, 101, root=root3)
+        self.assertNotEqual(
+            rival.signature,
+            h.sub(log, 3, 100, root=root3).signature)
+        with self.assertRaises(ApiError) as ctx:
+            svc.submit(log, rival)
+        self.assertEqual(ctx.exception.code, "fork_evidence_sealed")
+        self.assertEqual(
+            ctx.exception.details["historical_tree_size"], 3)
+
+        desc = svc.describe_log(log)
+        # Current trusted head is untouched...
+        self.assertEqual(desc["tree_size"], 5)
+        self.assertEqual(desc["root_hash"], h.roots[5].hex())
+        self.assertEqual(desc["public_key"], h.pub.hex())
+        self.assertEqual(desc["status"], "fork_sealed")
+        # ...and the evidence points at the ORIGINAL size-3 checkpoint.
+        fork = desc["fork"]
+        self.assertEqual(fork["trusted"]["tree_size"], 3)
+        self.assertEqual(fork["trusted"]["root_hash"], root3.hex())
+        self.assertEqual(fork["trusted"]["timestamp_ms"], 100)
+        self.assertEqual(fork["trusted"]["signature"],
+                         h.sub(log, 3, 100, root=root3).signature.hex())
+        self.assertEqual(fork["rival"]["timestamp_ms"], 101)
+        self.assertEqual(fork["rival"]["root_hash"], root3.hex())
+        self.assertEqual(fork["rival"]["signature"], rival.signature.hex())
+
+        # An exact replay of the original historical checkpoint still
+        # replays stably...
+        status, out = svc.submit(log, h.sub(log, 3, 100, root=root3))
+        self.assertEqual((status, out["result"]),
+                         (200, "already_trusted"))
+
+        # ...a second competing claim does not overwrite first evidence...
+        with self.assertRaises(ApiError):
+            svc.submit(log, h.sub(log, 3, 102, root=root3))
+        self.assertEqual(
+            svc.describe_log(log)["fork"]["rival"]["timestamp_ms"], 101)
+
+        # ...unknown old sizes stay stale...
+        with self.assertRaises(ApiError) as ctx:
+            svc.submit(log, h.sub(log, 2, 50))
+        self.assertEqual(ctx.exception.code, "stale_tree_size")
+
+        # ...and the sealed log can never advance.
+        with self.assertRaises(ApiError) as ctx:
+            svc.submit(log, h.sub(
+                log, 6, 300,
+                proof=merkle.consistency_proof(5, h.leaves[:6])))
+        self.assertEqual(ctx.exception.code, "log_sealed")
+
+        desc = svc.describe_log(log)
+        self.assertEqual(desc["tree_size"], 5)
+
     def test_stale_and_key_freeze(self):
         h, svc = self.h, self.h.svc
         log = "K"
